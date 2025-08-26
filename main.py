@@ -1,71 +1,74 @@
-import streamlit as st
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.vectorstores import Chroma
-from langchain_community.document_loaders import TextLoader, PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 import os
+import streamlit as st
+from langchain.prompts import PromptTemplate
+from langchain.chains import RetrievalQA
+from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings, HuggingFacePipeline
+from langchain_chroma import Chroma
+from transformers import pipeline
 
-# --------------------------
+
 # Streamlit UI
-# --------------------------
-st.set_page_config(page_title="Document Explainer", page_icon="📚")
-st.title("📚 Document Explainer")
+st.set_page_config(page_title="📘 Explainer", page_icon="📘", layout="centered")
+st.title("📘 Doc Explainer")
 
-uploaded_file = st.file_uploader("Upload a TXT or PDF file", type=["txt", "pdf"])
+uploaded_file = st.file_uploader("Upload a PDF or TXT file", type=["pdf", "txt"])
 
-# --------------------------
-# Process uploaded file
-# --------------------------
-documents = []
-
-if uploaded_file is not None:
-    # Save uploaded file to a temporary location
-    temp_path = os.path.join("temp_" + uploaded_file.name)
-    with open(temp_path, "wb") as f:
+if uploaded_file:
+    # Save uploaded file
+    file_path = os.path.join("uploads", uploaded_file.name)
+    os.makedirs("uploads", exist_ok=True)
+    with open(file_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
-    # Load documents based on file type
-    if uploaded_file.name.endswith(".txt"):
-        loader = TextLoader(temp_path, encoding="utf-8")
-    elif uploaded_file.name.endswith(".pdf"):
-        loader = PyPDFLoader(temp_path)
+    # Load & split document
+    if file_path.endswith(".pdf"):
+        loader = PyPDFLoader(file_path)
     else:
-        st.error("Unsupported file type")
-        st.stop()
+        loader = TextLoader(file_path, encoding="utf-8")
 
     documents = loader.load()
-    st.success(f"Loaded {len(documents)} document chunks.")
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200)
+    docs = text_splitter.split_documents(documents)
 
-if not documents:
-    st.info("Please upload a TXT or PDF file to continue.")
-    st.stop()
+    # Embeddings and Vector DB
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    vectorstore = Chroma.from_documents(docs, embeddings)
+    
+    # HuggingFace QnA model
+    model_name = "google/flan-t5-base" 
+    qa_pipeline = pipeline("text2text-generation", model=model_name, max_new_tokens=256)
+    llm = HuggingFacePipeline(pipeline=qa_pipeline)
 
-# --------------------------
-# Split documents
-# --------------------------
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-docs = text_splitter.split_documents(documents)
 
-# --------------------------
-# Embeddings & Vector Store
-# --------------------------
-embeddings = OpenAIEmbeddings()
-vectorstore = Chroma.from_documents(docs, embeddings)
+    # Custom prompt for cleaner answers(thanks gpt)
 
-# --------------------------
-# QA with LLM
-# --------------------------
-llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0)
+    template = """
+    You are a helpful assistant. Use the following context to answer the question.
+    If the answer is not in the document, say "I could not find that in the document."
 
-query = st.text_input("Ask a question about your document:")
+    Context:
+    {context}
 
-if query:
-    retriever = vectorstore.as_retriever()
-    relevant_docs = retriever.get_relevant_documents(query)
+    Question: {question}
 
-    context = "\n\n".join([doc.page_content for doc in relevant_docs[:3]])
-    prompt = f"Based on the document, answer the following:\n\nContext:\n{context}\n\nQuestion: {query}"
+    Answer:
+    """
+    qa_prompt = PromptTemplate(template=template, input_variables=["context", "question"])
 
-    response = llm.invoke(prompt)
-    st.markdown("### Answer:")
-    st.write(response.content)
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=llm,
+        retriever=vectorstore.as_retriever(),
+        chain_type_kwargs={"prompt": qa_prompt}
+    )
+
+
+    # for query 
+    query = st.text_input("Ask question:")
+
+    if query:
+        with st.spinner("Thinking..."):
+            response = qa_chain.run(query)
+        st.markdown("**Result:**")
+        st.write(response)
